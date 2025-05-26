@@ -7,12 +7,11 @@ on:
         description: Type of build (Debug, Release, RelWithDebInfo, MinSizeRel)
         type: string
         default: Debug
-      is_qt_cached: # Qt Caching within chroot is not implemented in this version. This input is kept for interface compatibility.
+      is_qt_cached:
         description: Enable Qt caching or not
         type: string
-        default: true
+        default: true # This input is less relevant now for Qt itself in chroot
     secrets:
-      # All secrets are kept for the callable workflow interface, though not all are used by this Linux chroot build.
       SPARKLE_ED25519_KEY:
         required: false
       WINDOWS_CODESIGN_CERT:
@@ -37,7 +36,7 @@ on:
         required: false
 
 jobs:
-  build_linux_in_chroot: # Renamed job for clarity
+  build_linux_in_chroot:
     strategy:
       fail-fast: false
       matrix:
@@ -46,20 +45,19 @@ jobs:
             qt_ver: 5
             qt_version: "5.15.2"
             qt_modules: "qtnetworkauth"
-            chroot_os_name: "ubuntu-20.04" # Explicitly state chroot target
+            chroot_os_name: "ubuntu-20.04"
 
           - name: "Linux-Qt6-Focal"
             qt_ver: 6
             qt_version: "6.5.3"
             qt_modules: "qt5compat qtimageformats qtnetworkauth"
-            chroot_os_name: "ubuntu-20.04" # Explicitly state chroot target
+            chroot_os_name: "ubuntu-20.04"
 
-    runs-on: ubuntu-latest # Host runner, e.g., ubuntu-22.04 or newer
+    runs-on: ubuntu-latest
 
     env:
       INSTALL_PORTABLE_DIR: "install-portable"
       BUILD_DIR: "build"
-      # CCACHE_VAR is set dynamically based on inputs.build_type
 
     steps:
       - name: Checkout Repository
@@ -72,25 +70,45 @@ jobs:
         run: |
           ver_short=$(git rev-parse --short HEAD)
           echo "VERSION=$ver_short" >> $GITHUB_ENV
-          echo "PROJECT_VERSION=$ver_short" >> $GITHUB_ENV # For chroot script
+          echo "PROJECT_VERSION=$ver_short" >> $GITHUB_ENV
 
-      - name: Setup ccache on host (for caching across runs)
+      - name: Attempt to setup ccache via hendrikmuhs/ccache-action
         if: inputs.build_type == 'Debug'
-        id: ccache_setup_host
+        id: ccache_action_runner
         uses: hendrikmuhs/ccache-action@v1.2.17
         with:
-          key: ${{ matrix.chroot_os_name }}-qt${{ matrix.qt_ver }} # Cache key based on chroot target and Qt version
+          key: ${{ matrix.chroot_os_name }}-qt${{ matrix.qt_ver }}-${{ github.sha }}
+          restore-keys: |
+            ${{ matrix.chroot_os_name }}-qt${{ matrix.qt_ver }}-
 
-      - name: Set CCACHE_VAR for chroot
+      - name: Validate ccache setup and set effective host ccache dir for output
         if: inputs.build_type == 'Debug'
+        id: ccache_validator # This step produces an output used by 'Prepare Chroot Environment'
         shell: bash
         run: |
-          echo "CHROOT_CCACHE_VAR=ccache" >> $GITHUB_ENV
-      - name: Set CCACHE_VAR to empty if not Debug
-        if: inputs.build_type != 'Debug'
+          HOST_CCACHE_DIR_FROM_ACTION="${{ steps.ccache_action_runner.outputs.ccache_dir }}"
+          echo "DEBUG: ccache_dir output from ccache_action_runner: '$HOST_CCACHE_DIR_FROM_ACTION'"
+          echo "DEBUG: cache-hit output from ccache_action_runner: '${{ steps.ccache_action_runner.outputs.cache-hit }}'"
+
+          if [ -n "$HOST_CCACHE_DIR_FROM_ACTION" ] && [ -d "$HOST_CCACHE_DIR_FROM_ACTION" ]; then
+            echo "Host ccache directory '$HOST_CCACHE_DIR_FROM_ACTION' is valid and exists."
+            echo "::set-output name=effective_host_ccache_dir::$HOST_CCACHE_DIR_FROM_ACTION"
+          else
+            echo "::warning:: Host ccache setup via action failed or directory ('$HOST_CCACHE_DIR_FROM_ACTION') is invalid/missing."
+            if [ -n "$HOST_CCACHE_DIR_FROM_ACTION" ] && [ ! -d "$HOST_CCACHE_DIR_FROM_ACTION" ]; then
+              echo "::warning:: Directory specified by ccache_dir does not exist."
+            fi
+            echo "::set-output name=effective_host_ccache_dir::" # Output empty string for fallback
+          fi
+
+      - name: Set CHROOT_CCACHE_VAR (for CMake launcher)
         shell: bash
         run: |
-          echo "CHROOT_CCACHE_VAR=" >> $GITHUB_ENV
+          if [ "${{ inputs.build_type }}" == "Debug" ]; then
+            echo "CHROOT_CCACHE_VAR=ccache" >> $GITHUB_ENV
+          else
+            echo "CHROOT_CCACHE_VAR=" >> $GITHUB_ENV
+          fi
 
       - name: Install Host Dependencies (wget)
         run: sudo apt-get update && sudo apt-get install -y wget
@@ -106,6 +124,9 @@ jobs:
           echo "Image extracted to ./chroot_ubuntu_20_04/"
 
       - name: Prepare Chroot Environment
+        shell: bash
+        env:
+            VALIDATED_HOST_CCACHE_DIR: ${{ steps.ccache_validator.outputs.effective_host_ccache_dir }}
         run: |
           echo "Mounting necessary filesystems into chroot (requires sudo)..."
           sudo mount --bind /dev ./chroot_ubuntu_20_04/dev
@@ -114,37 +135,64 @@ jobs:
           sudo mount -t sysfs sys ./chroot_ubuntu_20_04/sys
           sudo cp /etc/resolv.conf ./chroot_ubuntu_20_04/etc/resolv.conf
           sudo mkdir -p ./chroot_ubuntu_20_04/workspace
-          sudo mount --bind ${{ github.workspace }} ./chroot_ubuntu_20_04/workspace
+          sudo mount --bind "${{ github.workspace }}" ./chroot_ubuntu_20_04/workspace
+          sudo mkdir -p ./chroot_ubuntu_20_04/tmp
+
+          sudo rm -f ./chroot_ubuntu_20_04/tmp/host_ccache_mounted.signal
+
           if [ "${{ inputs.build_type }}" == "Debug" ]; then
-            echo "Mounting host ccache directory into chroot..."
-            sudo mkdir -p ./chroot_ubuntu_20_04/mnt/ccache
-            sudo mount --bind "${{ steps.ccache_setup_host.outputs.ccache_dir }}" ./chroot_ubuntu_20_04/mnt/ccache
+            echo "VALIDATED_HOST_CCACHE_DIR is: '$VALIDATED_HOST_CCACHE_DIR'"
+            if [ -n "$VALIDATED_HOST_CCACHE_DIR" ]; then
+              echo "Attempting to mount host ccache directory '$VALIDATED_HOST_CCACHE_DIR' into chroot..."
+              sudo mkdir -p ./chroot_ubuntu_20_04/mnt/ccache
+              if sudo mount --bind "$VALIDATED_HOST_CCACHE_DIR" ./chroot_ubuntu_20_04/mnt/ccache; then
+                echo "Host ccache directory successfully mounted to /mnt/ccache in chroot."
+                sudo touch ./chroot_ubuntu_20_04/tmp/host_ccache_mounted.signal
+                echo "Created /tmp/host_ccache_mounted.signal in chroot."
+              else
+                echo "::warning:: Failed to mount host ccache directory '$VALIDATED_HOST_CCACHE_DIR'. Proceeding without mounted host ccache."
+              fi
+            else
+              echo "::warning:: Validated host ccache directory is empty/invalid. Host ccache will not be mounted. Proceeding with local chroot ccache."
+            fi
+          else
+            echo "Not a Debug build, skipping ccache mount and signal file."
           fi
           echo "Chroot environment prepared."
 
       - name: Execute Build Script inside Chroot
-        env: # Pass matrix values and inputs to the script via environment variables
-          CHROOT_QT_VER: ${{ matrix.qt_ver }}
-          CHROOT_QT_VERSION: ${{ matrix.qt_version }}
-          CHROOT_QT_MODULES: ${{ matrix.qt_modules }}
-          CHROOT_BUILD_TYPE: ${{ inputs.build_type }}
-          # CHROOT_CCACHE_VAR is already set above
-          # PROJECT_VERSION is already set above
+        env:
+          PASSED_CHROOT_QT_VER: ${{ matrix.qt_ver }}
+          PASSED_CHROOT_QT_VERSION: ${{ matrix.qt_version }}
+          PASSED_CHROOT_QT_MODULES: ${{ matrix.qt_modules }}
+          PASSED_CHROOT_BUILD_TYPE: ${{ inputs.build_type }}
         run: |
           echo "Creating build script for chroot..."
           cat << 'EOF' > build_in_chroot.sh
           #!/bin/bash
           set -ex
 
-          echo "--- Inside chroot (${CHROOT_OS_NAME}) ---"
+          echo "--- Inside chroot ---"
+          echo "DEBUG CHROOT ENV: CHROOT_QT_VER='${CHROOT_QT_VER}'"
+          echo "DEBUG CHROOT ENV: CHROOT_QT_VERSION='${CHROOT_QT_VERSION}'"
+          echo "DEBUG CHROOT ENV: CHROOT_QT_MODULES='${CHROOT_QT_MODULES}'"
+          echo "DEBUG CHROOT ENV: CHROOT_BUILD_TYPE='${CHROOT_BUILD_TYPE}'"
+          echo "DEBUG CHROOT ENV: CHROOT_CCACHE_VAR='${CHROOT_CCACHE_VAR}'"
+          echo "DEBUG CHROOT ENV: PROJECT_VERSION='${PROJECT_VERSION}'"
+
           echo "Current directory: $(pwd)"
           cd /workspace
 
           export DEBIAN_FRONTEND=noninteractive
           export LANG=C.UTF-8
 
-          echo "Updating Apt Cache and installing base dependencies..."
+          echo "Enabling Universe repository and updating Apt Cache..."
           apt-get update
+          apt-get install -y --no-install-recommends software-properties-common ca-certificates
+          add-apt-repository universe
+          apt-get update
+
+          echo "Installing base dependencies..."
           apt-get install -y --no-install-recommends \
             build-essential \
             cmake \
@@ -152,28 +200,60 @@ jobs:
             extra-cmake-modules \
             scdoc \
             libxcb-cursor-dev \
+            python3-dev \
             python3-pip \
+            python-is-python3 \
             wget \
+            tar \
             git \
-            ca-certificates \
-            libbz2-1.0 libgobject-2.0-0 libssl1.1 libffi7 # For runtime lib packaging
+            libgl1-mesa-dev \
+            libbz2-dev libssl-dev libffi-dev libglib2.0-dev
+
+          echo "Downloading and installing Adoptium Temurin JDK 17..."
+          JDK_VERSION_TAG="jdk-17.0.15%2B6" # URL encoded version for download link
+          JDK_TARBALL_NAME="OpenJDK17U-jdk_x64_linux_hotspot_17.0.15_6.tar.gz"
+          JDK_DOWNLOAD_URL="https://github.com/adoptium/temurin17-binaries/releases/download/${JDK_VERSION_TAG}/${JDK_TARBALL_NAME}"
+          JDK_INSTALL_DIR="/opt/java/temurin-17"
+
+          mkdir -p "${JDK_INSTALL_DIR}"
+          echo "Downloading JDK from ${JDK_DOWNLOAD_URL}..."
+          wget --no-verbose "${JDK_DOWNLOAD_URL}" -O "/tmp/${JDK_TARBALL_NAME}"
+          echo "Extracting JDK to ${JDK_INSTALL_DIR}..."
+          tar -xzf "/tmp/${JDK_TARBALL_NAME}" -C "${JDK_INSTALL_DIR}" --strip-components=1
+          rm "/tmp/${JDK_TARBALL_NAME}"
+
+          export JAVA_HOME="${JDK_INSTALL_DIR}"
+          export PATH="${JAVA_HOME}/bin:${PATH}"
+          echo "JAVA_HOME set to ${JAVA_HOME}"
+          
+          echo "Verifying Java installation..."
+          java -version || echo "java command not found after manual install"
+          javac -version || echo "javac command not found after manual install"
+
+          CHROOT_EFFECTIVE_CCACHE_DIR="/tmp/ccache_local_chroot"
 
           if [ "${CHROOT_BUILD_TYPE}" == "Debug" ]; then
             echo "Setting up ccache inside chroot..."
             apt-get install -y --no-install-recommends ccache
-            mkdir -p /root/.ccache # Default ccache dir if not overridden by config
-            ccache --set-config=cache_dir=/mnt/ccache
-            ccache --set-config=max_size='500M' # Example, align with host if needed
-            ccache -p # Show config
-            ccache -z # Zero stats for this specific build
+            if [ -f /tmp/host_ccache_mounted.signal ]; then
+              echo "Host ccache signal file found. Using MOUNTED ccache at /mnt/ccache."
+              CHROOT_EFFECTIVE_CCACHE_DIR="/mnt/ccache"
+            else
+              echo "Host ccache signal file NOT found. Using LOCAL chroot ccache at $CHROOT_EFFECTIVE_CCACHE_DIR."
+              mkdir -p $CHROOT_EFFECTIVE_CCACHE_DIR
+            fi
+            mkdir -p /root/.ccache
+            echo "cache_dir = $CHROOT_EFFECTIVE_CCACHE_DIR" > /root/.ccache/ccache.conf
+            echo "max_size = 500M" >> /root/.ccache/ccache.conf
+            ccache -p
+            ccache -z
           fi
 
           echo "Installing aqtinstaller..."
+          pip3 install --upgrade pip
           pip3 install aqtinstall==3.1.* py7zr>=0.20.2
 
-          echo "Installing Qt ${CHROOT_QT_VERSION} (Major ${CHROOT_QT_VER})..."
-          # Qt Arch for Linux desktop is gcc_64
-          # Qt modules are passed via CHROOT_QT_MODULES
+          echo "Installing Qt ${CHROOT_QT_VERSION} (Major ${CHROOT_QT_VER}) modules: '${CHROOT_QT_MODULES}'"
           QT_INSTALL_PATH="/opt/Qt"
           mkdir -p $QT_INSTALL_PATH
           aqt install-qt linux desktop "${CHROOT_QT_VERSION}" gcc_64 -m "${CHROOT_QT_MODULES}" -O "${QT_INSTALL_PATH}"
@@ -186,14 +266,10 @@ jobs:
           fi
           export CMAKE_PREFIX_PATH="${QT_CMAKE_PREFIX_PATH}:${CMAKE_PREFIX_PATH}"
 
-
           echo "Configuring CMake (pass 1 - build tree for tests)..."
-          # Build artifacts in /workspace/build, which is ${{ github.workspace }}/build on host
           BUILD_DIR_CHROOT="/workspace/build"
-          INSTALL_PORTABLE_DIR_CHROOT="/workspace/install-portable" # Relative to /workspace in chroot
-
-          mkdir -p ${BUILD_DIR_CHROOT}
-          rm -rf ${BUILD_DIR_CHROOT}/*
+          INSTALL_PORTABLE_DIR_CHROOT="/workspace/install-portable"
+          mkdir -p ${BUILD_DIR_CHROOT}; rm -rf ${BUILD_DIR_CHROOT}/*
           cmake -S /workspace \
             -B ${BUILD_DIR_CHROOT} \
             -DCMAKE_INSTALL_PREFIX=/usr \
@@ -207,17 +283,15 @@ jobs:
             -DLauncher_BUILD_ARTIFACT=Linux-Qt${CHROOT_QT_VER} \
             -G Ninja
 
-          echo "Building..."
+          echo "Building (pass 1)..."
           cmake --build ${BUILD_DIR_CHROOT}
 
           echo "Testing..."
-          # Ensure tests can find Qt libs if they are not rpath'd correctly for build-tree execution
           export LD_LIBRARY_PATH="${QT_INSTALL_PATH}/${CHROOT_QT_VERSION}/gcc_64/lib:${LD_LIBRARY_PATH}"
           ctest -E "^example64|example$" --test-dir ${BUILD_DIR_CHROOT} --output-on-failure
 
-          echo "Packaging (Linux, portable)..."
-          mkdir -p ${INSTALL_PORTABLE_DIR_CHROOT}
-          rm -rf ${BUILD_DIR_CHROOT}/* # Clean build dir for portable reconfigure
+          echo "Packaging (Linux, portable - reconfiguring CMake)..."
+          mkdir -p ${INSTALL_PORTABLE_DIR_CHROOT}; rm -rf ${BUILD_DIR_CHROOT}/*
           cmake -S /workspace \
             -B ${BUILD_DIR_CHROOT} \
             -DCMAKE_INSTALL_PREFIX=${INSTALL_PORTABLE_DIR_CHROOT} \
@@ -231,31 +305,31 @@ jobs:
             -DINSTALL_BUNDLE=full \
             -G Ninja
 
+          echo "Building (pass 2 - for portable)..."
           cmake --build ${BUILD_DIR_CHROOT}
+          echo "Installing (pass 2 - for portable)..."
           cmake --install ${BUILD_DIR_CHROOT}
           cmake --install ${BUILD_DIR_CHROOT} --component portable
 
+          echo "Copying runtime libraries for portable package..."
           mkdir -p "${INSTALL_PORTABLE_DIR_CHROOT}/lib"
-          # Copy libraries for Ubuntu 20.04 (Focal)
-          # Using -L to copy the target file if it's a symlink. Appending '*' to copy related files if needed.
-          cp -L /lib/x86_64-linux-gnu/libbz2.so.1.0* "${INSTALL_PORTABLE_DIR_CHROOT}/lib/" || echo "libbz2 copy failed"
-          cp -L /usr/lib/x86_64-linux-gnu/libgobject-2.0.so.0* "${INSTALL_PORTABLE_DIR_CHROOT}/lib/" || echo "libgobject copy failed"
-          cp -L /usr/lib/x86_64-linux-gnu/libcrypto.so.1.1 "${INSTALL_PORTABLE_DIR_CHROOT}/lib/" || echo "libcrypto copy failed" # Specific version for OpenSSL 1.1
-          cp -L /usr/lib/x86_64-linux-gnu/libssl.so.1.1 "${INSTALL_PORTABLE_DIR_CHROOT}/lib/" || echo "libssl copy failed"    # Specific version for OpenSSL 1.1
-          cp -L /usr/lib/x86_64-linux-gnu/libffi.so.7* "${INSTALL_PORTABLE_DIR_CHROOT}/lib/" || echo "libffi copy failed" # For libffi7 on Focal
+          apt-get install -y --no-install-recommends libglib2.0-0 libopengl0
+          cp -L /lib/x86_64-linux-gnu/libbz2.so.1.0* "${INSTALL_PORTABLE_DIR_CHROOT}/lib/" || echo "Warning: libbz2 copy failed"
+          cp -L /usr/lib/x86_64-linux-gnu/libgobject-2.0.so.0* "${INSTALL_PORTABLE_DIR_CHROOT}/lib/" || echo "Warning: libgobject copy failed"
+          cp -L /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0* "${INSTALL_PORTABLE_DIR_CHROOT}/lib/" || echo "Warning: libglib copy failed"
+          cp -L /usr/lib/x86_64-linux-gnu/libcrypto.so.1.1 "${INSTALL_PORTABLE_DIR_CHROOT}/lib/" || echo "Warning: libcrypto.so.1.1 copy failed"
+          cp -L /usr/lib/x86_64-linux-gnu/libssl.so.1.1 "${INSTALL_PORTABLE_DIR_CHROOT}/lib/" || echo "Warning: libssl.so.1.1 copy failed"
+          cp -L /usr/lib/x86_64-linux-gnu/libffi.so.7* "${INSTALL_PORTABLE_DIR_CHROOT}/lib/" || echo "Warning: libffi7 copy failed"
+          cp -L /usr/lib/x86_64-linux-gnu/libOpenGL.so.0* "${INSTALL_PORTABLE_DIR_CHROOT}/lib/" || echo "Warning: libOpenGL copy failed"
+          find "${INSTALL_PORTABLE_DIR_CHROOT}/bin" -name "*.so*" -exec mv {} "${INSTALL_PORTABLE_DIR_CHROOT}/lib/" \; || echo "Warning: Moving .so files from bin/ failed or no files found"
 
-          # Move any .so files from bin to lib
-          find "${INSTALL_PORTABLE_DIR_CHROOT}/bin" -name "*.so*" -exec mv {} "${INSTALL_PORTABLE_DIR_CHROOT}/lib/" \; || echo "Moving .so files from bin/ failed or no files found"
-
-          # Create manifest and tarball
-          # Output tarball to /workspace, accessible by host at ${{ github.workspace }}
+          echo "Creating portable tarball..."
           cd "${INSTALL_PORTABLE_DIR_CHROOT}"
-          # Generate manifest of files in the portable directory
           find . -type f | sed 's|^\./||' > manifest.txt
           tar -czf "/workspace/PrismLauncher-portable-Qt${CHROOT_QT_VER}-${PROJECT_VERSION}.tar.gz" .
 
           if [ "${CHROOT_BUILD_TYPE}" == "Debug" ]; then
-            echo "Displaying ccache stats from chroot..."
+            echo "Displaying ccache stats from chroot (using $CHROOT_EFFECTIVE_CCACHE_DIR)..."
             ccache -s
           fi
           echo "--- Exiting chroot ---"
@@ -264,39 +338,39 @@ jobs:
 
           chmod +x build_in_chroot.sh
           echo "Entering chroot to execute build script (requires sudo)..."
-          # Pass CHROOT_OS_NAME for script's internal reference if needed
-          sudo CHROOT_OS_NAME="${{ matrix.chroot_os_name }}" \
-               QT_VER="${CHROOT_QT_VER}" \
-               QT_VERSION="${CHROOT_QT_VERSION}" \
-               QT_MODULES="${CHROOT_QT_MODULES}" \
-               BUILD_TYPE_INPUT="${CHROOT_BUILD_TYPE}" \
-               PROJECT_VERSION="${PROJECT_VERSION}" \
-               EFFECTIVE_CCACHE_VAR="${CHROOT_CCACHE_VAR}" \
-               chroot ./chroot_ubuntu_20_04 /bin/bash /workspace/build_in_chroot.sh
-          # The script itself reads from CHROOT_* env vars set by the 'env:' block of this step.
-          # The sudo chroot line also re-exports some for clarity/direct use if the script didn't source env.
-          # Simpler: sudo chroot ./chroot_ubuntu_20_04 /bin/bash -c "cd /workspace && ./build_in_chroot.sh"
-          # The current cat << EOF writes env vars directly into the script which is fine.
-          # The `env:` block for the `Execute Build Script inside Chroot` step makes these vars available to the `cat` command.
-          # So, the `sudo chroot ... VAR=val ...` part is redundant if script sources them.
-          # The script created uses the CHROOT_* variables.
-          sudo chroot ./chroot_ubuntu_20_04 /bin/bash /workspace/build_in_chroot.sh
-
+          # CHROOT_CCACHE_VAR and PROJECT_VERSION are available from GITHUB_ENV
+          # PASSED_* variables are from this step's `env:` block
+          sudo \
+            CHROOT_QT_VER="${PASSED_CHROOT_QT_VER}" \
+            CHROOT_QT_VERSION="${PASSED_CHROOT_QT_VERSION}" \
+            CHROOT_QT_MODULES="${PASSED_CHROOT_QT_MODULES}" \
+            CHROOT_BUILD_TYPE="${PASSED_CHROOT_BUILD_TYPE}" \
+            CHROOT_CCACHE_VAR="${CHROOT_CCACHE_VAR}" \
+            PROJECT_VERSION="${PROJECT_VERSION}" \
+            chroot ./chroot_ubuntu_20_04 /bin/bash /workspace/build_in_chroot.sh
           echo "Build script execution finished."
 
-      - name: Unmount chroot (optional, for cleanup)
-        if: always() # Run even if previous steps fail, to attempt cleanup
+      - name: Unmount chroot
+        if: always()
         run: |
           echo "Unmounting chroot filesystems..."
           if [ "${{ inputs.build_type }}" == "Debug" ]; then
-            sudo umount ./chroot_ubuntu_20_04/mnt/ccache || echo "Failed to unmount ccache dir or not mounted."
+            if mountpoint -q ./chroot_ubuntu_20_04/mnt/ccache; then
+              sudo umount ./chroot_ubuntu_20_04/mnt/ccache
+            else
+              echo "./chroot_ubuntu_20_04/mnt/ccache was not mounted or already unmounted."
+            fi
           fi
-          sudo umount ./chroot_ubuntu_20_04/workspace || echo "Failed to unmount workspace."
-          sudo umount ./chroot_ubuntu_20_04/dev/pts || echo "Failed to unmount dev/pts."
-          sudo umount ./chroot_ubuntu_20_04/dev || echo "Failed to unmount dev."
-          sudo umount ./chroot_ubuntu_20_04/proc || echo "Failed to unmount proc."
-          sudo umount ./chroot_ubuntu_20_04/sys || echo "Failed to unmount sys."
-          echo "Chroot unmounted."
+          for mp_suffix in workspace dev/pts dev proc sys; do
+            mp="./chroot_ubuntu_20_04/$mp_suffix"
+            if mountpoint -q "$mp"; then
+              sudo umount "$mp"
+            else
+              echo "$mp was not mounted or already unmounted."
+            fi
+          done
+          echo "Chroot unmounting attempted."
+
 
       - name: Upload binary tarball (Linux, portable)
         uses: actions/upload-artifact@v4
