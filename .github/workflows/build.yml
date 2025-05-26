@@ -7,165 +7,300 @@ on:
         description: Type of build (Debug, Release, RelWithDebInfo, MinSizeRel)
         type: string
         default: Debug
-      is_qt_cached:
+      is_qt_cached: # Qt Caching within chroot is not implemented in this version. This input is kept for interface compatibility.
         description: Enable Qt caching or not
         type: string
         default: true
     secrets:
+      # All secrets are kept for the callable workflow interface, though not all are used by this Linux chroot build.
       SPARKLE_ED25519_KEY:
-        description: Private key for signing Sparkle updates
         required: false
       WINDOWS_CODESIGN_CERT:
-        description: Certificate for signing Windows builds
         required: false
       WINDOWS_CODESIGN_PASSWORD:
-        description: Password for signing Windows builds
         required: false
       APPLE_CODESIGN_CERT:
-        description: Certificate for signing macOS builds
         required: false
       APPLE_CODESIGN_PASSWORD:
-        description: Password for signing macOS builds
         required: false
       APPLE_CODESIGN_ID:
-        description: Certificate ID for signing macOS builds
         required: false
       APPLE_NOTARIZE_APPLE_ID:
-        description: Apple ID used for notarizing macOS builds
         required: false
       APPLE_NOTARIZE_TEAM_ID:
-        description: Team ID used for notarizing macOS builds
         required: false
       APPLE_NOTARIZE_PASSWORD:
-        description: Password used for notarizing macOS builds
         required: false
       GPG_PRIVATE_KEY:
-        description: Private key for AppImage signing
         required: false
       GPG_PRIVATE_KEY_ID:
-        description: ID for the GPG_PRIVATE_KEY, to select the signing key
         required: false
 
 jobs:
-  build:
+  build_linux_in_chroot: # Renamed job for clarity
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04
-            name: "Linux-Qt5"
+          - name: "Linux-Qt5-Focal"
             qt_ver: 5
-            qt_host: linux
-            qt_arch: ""
             qt_version: "5.15.2"
             qt_modules: "qtnetworkauth"
+            chroot_os_name: "ubuntu-20.04" # Explicitly state chroot target
 
-          - os: ubuntu-22.04
-            name: "Linux-Qt6"
+          - name: "Linux-Qt6-Focal"
             qt_ver: 6
-            qt_host: linux
-            qt_arch: ""
             qt_version: "6.5.3"
             qt_modules: "qt5compat qtimageformats qtnetworkauth"
+            chroot_os_name: "ubuntu-20.04" # Explicitly state chroot target
 
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest # Host runner, e.g., ubuntu-22.04 or newer
 
     env:
-      INSTALL_DIR: "install"
       INSTALL_PORTABLE_DIR: "install-portable"
       BUILD_DIR: "build"
-      CCACHE_VAR: ""
+      # CCACHE_VAR is set dynamically based on inputs.build_type
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          submodules: "true"
-
-      - name: Setup ccache
-        if: runner.os == 'Linux' && inputs.build_type == 'Debug'
-        uses: hendrikmuhs/ccache-action@v1.2.17
-        with:
-          key: ${{ matrix.os }}-qt${{ matrix.qt_ver }}-${{ matrix.architecture }}
-
-      - name: Use ccache on Debug builds only
-        if: inputs.build_type == 'Debug'
-        shell: bash
-        run: |
-          echo "CCACHE_VAR=ccache" >> $GITHUB_ENV
+          submodules: 'recursive'
 
       - name: Set short version
         shell: bash
         run: |
-          ver_short=`git rev-parse --short HEAD`
+          ver_short=$(git rev-parse --short HEAD)
           echo "VERSION=$ver_short" >> $GITHUB_ENV
+          echo "PROJECT_VERSION=$ver_short" >> $GITHUB_ENV # For chroot script
 
-      - name: Install Dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get -y update
-          sudo apt-get -y install ninja-build extra-cmake-modules scdoc libxcb-cursor-dev
-
-      - name: Install Qt (Linux)
-        if: runner.os == 'Linux'
-        uses: jurplel/install-qt-action@v4
+      - name: Setup ccache on host (for caching across runs)
+        if: inputs.build_type == 'Debug'
+        id: ccache_setup_host
+        uses: hendrikmuhs/ccache-action@v1.2.17
         with:
-          aqtversion: "==3.1.*"
-          py7zrversion: ">=0.20.2"
-          version: ${{ matrix.qt_version }}
-          host: ${{ matrix.qt_host }}
-          target: "desktop"
-          arch: ${{ matrix.qt_arch }} 
-          modules: ${{ matrix.qt_modules }}
-          cache: ${{ inputs.is_qt_cached }}
+          key: ${{ matrix.chroot_os_name }}-qt${{ matrix.qt_ver }} # Cache key based on chroot target and Qt version
 
-      - name: Configure CMake (Linux)
-        if: runner.os == 'Linux'
+      - name: Set CCACHE_VAR for chroot
+        if: inputs.build_type == 'Debug'
+        shell: bash
         run: |
-          cmake -S . -B ${{ env.BUILD_DIR }} -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=${{ inputs.build_type }} -DENABLE_LTO=ON -DLauncher_ENABLE_JAVA_DOWNLOADER=ON -DLauncher_BUILD_PLATFORM=official -DCMAKE_C_COMPILER_LAUNCHER=${{ env.CCACHE_VAR }} -DCMAKE_CXX_COMPILER_LAUNCHER=${{ env.CCACHE_VAR }} -DLauncher_QT_VERSION_MAJOR=${{ matrix.qt_ver }} -DLauncher_BUILD_ARTIFACT=Linux-Qt${{ matrix.qt_ver }} -G Ninja
-
-      - name: Build
-        if: runner.os == 'Linux'
+          echo "CHROOT_CCACHE_VAR=ccache" >> $GITHUB_ENV
+      - name: Set CCACHE_VAR to empty if not Debug
+        if: inputs.build_type != 'Debug'
+        shell: bash
         run: |
-          cmake --build ${{ env.BUILD_DIR }}
+          echo "CHROOT_CCACHE_VAR=" >> $GITHUB_ENV
 
-      - name: Test
-        if: runner.os == 'Linux'
+      - name: Install Host Dependencies (wget)
+        run: sudo apt-get update && sudo apt-get install -y wget
+
+      - name: Download and Extract Ubuntu 20.04 Image for Chroot
         run: |
-          ctest -E "^example64|example$" --test-dir build --output-on-failure
+          echo "Downloading Ubuntu 20.04 dwarf image..."
+          wget --no-verbose https://github.com/FDrach/quick-debootstrap-images/releases/download/ubuntu-20.04-self-dwarfs/20.04.dwarf -O 20.04.dwarf
+          chmod +x 20.04.dwarf
+          mkdir chroot_ubuntu_20_04
+          echo "Extracting image (requires sudo)..."
+          sudo ./20.04.dwarf --tool=dwarfsextract -i 20.04.dwarf -o chroot_ubuntu_20_04
+          echo "Image extracted to ./chroot_ubuntu_20_04/"
 
-      - name: Package (Linux, portable)
-        if: runner.os == 'Linux'
+      - name: Prepare Chroot Environment
         run: |
-          rm -rf ${{ env.BUILD_DIR }}/*
-          cmake -S . -B ${{ env.BUILD_DIR }} -DCMAKE_INSTALL_PREFIX=${{ env.INSTALL_PORTABLE_DIR }} -DCMAKE_BUILD_TYPE=${{ inputs.build_type }} -DENABLE_LTO=ON -DLauncher_BUILD_PLATFORM=official -DCMAKE_C_COMPILER_LAUNCHER=${{ env.CCACHE_VAR }} -DCMAKE_CXX_COMPILER_LAUNCHER=${{ env.CCACHE_VAR }} -DLauncher_QT_VERSION_MAJOR=${{ matrix.qt_ver }} -DLauncher_BUILD_ARTIFACT=Linux-Qt${{ matrix.qt_ver }} -DINSTALL_BUNDLE=full -G Ninja
-          cmake --build ${{ env.BUILD_DIR }}
-          cmake --install ${{ env.BUILD_DIR }}
-          cmake --install ${{ env.BUILD_DIR }} --component portable
+          echo "Mounting necessary filesystems into chroot (requires sudo)..."
+          sudo mount --bind /dev ./chroot_ubuntu_20_04/dev
+          sudo mount --bind /dev/pts ./chroot_ubuntu_20_04/dev/pts
+          sudo mount -t proc proc ./chroot_ubuntu_20_04/proc
+          sudo mount -t sysfs sys ./chroot_ubuntu_20_04/sys
+          sudo cp /etc/resolv.conf ./chroot_ubuntu_20_04/etc/resolv.conf
+          sudo mkdir -p ./chroot_ubuntu_20_04/workspace
+          sudo mount --bind ${{ github.workspace }} ./chroot_ubuntu_20_04/workspace
+          if [ "${{ inputs.build_type }}" == "Debug" ]; then
+            echo "Mounting host ccache directory into chroot..."
+            sudo mkdir -p ./chroot_ubuntu_20_04/mnt/ccache
+            sudo mount --bind "${{ steps.ccache_setup_host.outputs.ccache_dir }}" ./chroot_ubuntu_20_04/mnt/ccache
+          fi
+          echo "Chroot environment prepared."
 
-          mkdir -p ${{ env.INSTALL_PORTABLE_DIR }}/lib
-          cp /lib/x86_64-linux-gnu/libbz2.so.1.0* ${{ env.INSTALL_PORTABLE_DIR }}/lib/ || true
-          cp /usr/lib/x86_64-linux-gnu/libgobject-2.0.so.0* ${{ env.INSTALL_PORTABLE_DIR }}/lib/ || true
-          cp /usr/lib/x86_64-linux-gnu/libcrypto.so.* ${{ env.INSTALL_PORTABLE_DIR }}/lib/ || true
-          cp /usr/lib/x86_64-linux-gnu/libssl.so.* ${{ env.INSTALL_PORTABLE_DIR }}/lib/ || true
-          cp /usr/lib/x86_64-linux-gnu/libffi.so.*.* ${{ env.INSTALL_PORTABLE_DIR }}/lib/ || true
+      - name: Execute Build Script inside Chroot
+        env: # Pass matrix values and inputs to the script via environment variables
+          CHROOT_QT_VER: ${{ matrix.qt_ver }}
+          CHROOT_QT_VERSION: ${{ matrix.qt_version }}
+          CHROOT_QT_MODULES: ${{ matrix.qt_modules }}
+          CHROOT_BUILD_TYPE: ${{ inputs.build_type }}
+          # CHROOT_CCACHE_VAR is already set above
+          # PROJECT_VERSION is already set above
+        run: |
+          echo "Creating build script for chroot..."
+          cat << 'EOF' > build_in_chroot.sh
+          #!/bin/bash
+          set -ex
+
+          echo "--- Inside chroot (${CHROOT_OS_NAME}) ---"
+          echo "Current directory: $(pwd)"
+          cd /workspace
+
+          export DEBIAN_FRONTEND=noninteractive
+          export LANG=C.UTF-8
+
+          echo "Updating Apt Cache and installing base dependencies..."
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            extra-cmake-modules \
+            scdoc \
+            libxcb-cursor-dev \
+            python3-pip \
+            wget \
+            git \
+            ca-certificates \
+            libbz2-1.0 libgobject-2.0-0 libssl1.1 libffi7 # For runtime lib packaging
+
+          if [ "${CHROOT_BUILD_TYPE}" == "Debug" ]; then
+            echo "Setting up ccache inside chroot..."
+            apt-get install -y --no-install-recommends ccache
+            mkdir -p /root/.ccache # Default ccache dir if not overridden by config
+            ccache --set-config=cache_dir=/mnt/ccache
+            ccache --set-config=max_size='500M' # Example, align with host if needed
+            ccache -p # Show config
+            ccache -z # Zero stats for this specific build
+          fi
+
+          echo "Installing aqtinstaller..."
+          pip3 install aqtinstall==3.1.* py7zr>=0.20.2
+
+          echo "Installing Qt ${CHROOT_QT_VERSION} (Major ${CHROOT_QT_VER})..."
+          # Qt Arch for Linux desktop is gcc_64
+          # Qt modules are passed via CHROOT_QT_MODULES
+          QT_INSTALL_PATH="/opt/Qt"
+          mkdir -p $QT_INSTALL_PATH
+          aqt install-qt linux desktop "${CHROOT_QT_VERSION}" gcc_64 -m "${CHROOT_QT_MODULES}" -O "${QT_INSTALL_PATH}"
           
-          find ${{ env.INSTALL_PORTABLE_DIR }}/bin -name "*.so*" -exec mv {} ${{ env.INSTALL_PORTABLE_DIR }}/lib \; || true
+          QT_CMAKE_PREFIX_PATH="${QT_INSTALL_PATH}/${CHROOT_QT_VERSION}/gcc_64/lib/cmake"
+          if [ "${CHROOT_QT_VER}" == "5" ]; then
+            export Qt5_Dir="${QT_CMAKE_PREFIX_PATH}/Qt5"
+          else
+            export Qt6_Dir="${QT_CMAKE_PREFIX_PATH}/Qt6"
+          fi
+          export CMAKE_PREFIX_PATH="${QT_CMAKE_PREFIX_PATH}:${CMAKE_PREFIX_PATH}"
 
-          for l in $(find ${{ env.INSTALL_PORTABLE_DIR }} -type f); do l=${l#$(pwd)/}; l=${l#${{ env.INSTALL_PORTABLE_DIR }}/}; l=${l#./}; echo $l; done > ${{ env.INSTALL_PORTABLE_DIR }}/manifest.txt
-          cd ${{ env.INSTALL_PORTABLE_DIR }}
-          tar -czf ../PrismLauncher-portable-Qt${{ matrix.qt_ver }}.tar.gz *
 
-      - name: Upload binary tarball (Linux, portable, Qt 5)
-        if: runner.os == 'Linux' && matrix.qt_ver == 5
+          echo "Configuring CMake (pass 1 - build tree for tests)..."
+          # Build artifacts in /workspace/build, which is ${{ github.workspace }}/build on host
+          BUILD_DIR_CHROOT="/workspace/build"
+          INSTALL_PORTABLE_DIR_CHROOT="/workspace/install-portable" # Relative to /workspace in chroot
+
+          mkdir -p ${BUILD_DIR_CHROOT}
+          rm -rf ${BUILD_DIR_CHROOT}/*
+          cmake -S /workspace \
+            -B ${BUILD_DIR_CHROOT} \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DCMAKE_BUILD_TYPE=${CHROOT_BUILD_TYPE} \
+            -DENABLE_LTO=ON \
+            -DLauncher_ENABLE_JAVA_DOWNLOADER=ON \
+            -DLauncher_BUILD_PLATFORM=official \
+            -DCMAKE_C_COMPILER_LAUNCHER=${CHROOT_CCACHE_VAR} \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=${CHROOT_CCACHE_VAR} \
+            -DLauncher_QT_VERSION_MAJOR=${CHROOT_QT_VER} \
+            -DLauncher_BUILD_ARTIFACT=Linux-Qt${CHROOT_QT_VER} \
+            -G Ninja
+
+          echo "Building..."
+          cmake --build ${BUILD_DIR_CHROOT}
+
+          echo "Testing..."
+          # Ensure tests can find Qt libs if they are not rpath'd correctly for build-tree execution
+          export LD_LIBRARY_PATH="${QT_INSTALL_PATH}/${CHROOT_QT_VERSION}/gcc_64/lib:${LD_LIBRARY_PATH}"
+          ctest -E "^example64|example$" --test-dir ${BUILD_DIR_CHROOT} --output-on-failure
+
+          echo "Packaging (Linux, portable)..."
+          mkdir -p ${INSTALL_PORTABLE_DIR_CHROOT}
+          rm -rf ${BUILD_DIR_CHROOT}/* # Clean build dir for portable reconfigure
+          cmake -S /workspace \
+            -B ${BUILD_DIR_CHROOT} \
+            -DCMAKE_INSTALL_PREFIX=${INSTALL_PORTABLE_DIR_CHROOT} \
+            -DCMAKE_BUILD_TYPE=${CHROOT_BUILD_TYPE} \
+            -DENABLE_LTO=ON \
+            -DLauncher_BUILD_PLATFORM=official \
+            -DCMAKE_C_COMPILER_LAUNCHER=${CHROOT_CCACHE_VAR} \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=${CHROOT_CCACHE_VAR} \
+            -DLauncher_QT_VERSION_MAJOR=${CHROOT_QT_VER} \
+            -DLauncher_BUILD_ARTIFACT=Linux-Qt${CHROOT_QT_VER} \
+            -DINSTALL_BUNDLE=full \
+            -G Ninja
+
+          cmake --build ${BUILD_DIR_CHROOT}
+          cmake --install ${BUILD_DIR_CHROOT}
+          cmake --install ${BUILD_DIR_CHROOT} --component portable
+
+          mkdir -p "${INSTALL_PORTABLE_DIR_CHROOT}/lib"
+          # Copy libraries for Ubuntu 20.04 (Focal)
+          # Using -L to copy the target file if it's a symlink. Appending '*' to copy related files if needed.
+          cp -L /lib/x86_64-linux-gnu/libbz2.so.1.0* "${INSTALL_PORTABLE_DIR_CHROOT}/lib/" || echo "libbz2 copy failed"
+          cp -L /usr/lib/x86_64-linux-gnu/libgobject-2.0.so.0* "${INSTALL_PORTABLE_DIR_CHROOT}/lib/" || echo "libgobject copy failed"
+          cp -L /usr/lib/x86_64-linux-gnu/libcrypto.so.1.1 "${INSTALL_PORTABLE_DIR_CHROOT}/lib/" || echo "libcrypto copy failed" # Specific version for OpenSSL 1.1
+          cp -L /usr/lib/x86_64-linux-gnu/libssl.so.1.1 "${INSTALL_PORTABLE_DIR_CHROOT}/lib/" || echo "libssl copy failed"    # Specific version for OpenSSL 1.1
+          cp -L /usr/lib/x86_64-linux-gnu/libffi.so.7* "${INSTALL_PORTABLE_DIR_CHROOT}/lib/" || echo "libffi copy failed" # For libffi7 on Focal
+
+          # Move any .so files from bin to lib
+          find "${INSTALL_PORTABLE_DIR_CHROOT}/bin" -name "*.so*" -exec mv {} "${INSTALL_PORTABLE_DIR_CHROOT}/lib/" \; || echo "Moving .so files from bin/ failed or no files found"
+
+          # Create manifest and tarball
+          # Output tarball to /workspace, accessible by host at ${{ github.workspace }}
+          cd "${INSTALL_PORTABLE_DIR_CHROOT}"
+          # Generate manifest of files in the portable directory
+          find . -type f | sed 's|^\./||' > manifest.txt
+          tar -czf "/workspace/PrismLauncher-portable-Qt${CHROOT_QT_VER}-${PROJECT_VERSION}.tar.gz" .
+
+          if [ "${CHROOT_BUILD_TYPE}" == "Debug" ]; then
+            echo "Displaying ccache stats from chroot..."
+            ccache -s
+          fi
+          echo "--- Exiting chroot ---"
+          exit 0
+          EOF
+
+          chmod +x build_in_chroot.sh
+          echo "Entering chroot to execute build script (requires sudo)..."
+          # Pass CHROOT_OS_NAME for script's internal reference if needed
+          sudo CHROOT_OS_NAME="${{ matrix.chroot_os_name }}" \
+               QT_VER="${CHROOT_QT_VER}" \
+               QT_VERSION="${CHROOT_QT_VERSION}" \
+               QT_MODULES="${CHROOT_QT_MODULES}" \
+               BUILD_TYPE_INPUT="${CHROOT_BUILD_TYPE}" \
+               PROJECT_VERSION="${PROJECT_VERSION}" \
+               EFFECTIVE_CCACHE_VAR="${CHROOT_CCACHE_VAR}" \
+               chroot ./chroot_ubuntu_20_04 /bin/bash /workspace/build_in_chroot.sh
+          # The script itself reads from CHROOT_* env vars set by the 'env:' block of this step.
+          # The sudo chroot line also re-exports some for clarity/direct use if the script didn't source env.
+          # Simpler: sudo chroot ./chroot_ubuntu_20_04 /bin/bash -c "cd /workspace && ./build_in_chroot.sh"
+          # The current cat << EOF writes env vars directly into the script which is fine.
+          # The `env:` block for the `Execute Build Script inside Chroot` step makes these vars available to the `cat` command.
+          # So, the `sudo chroot ... VAR=val ...` part is redundant if script sources them.
+          # The script created uses the CHROOT_* variables.
+          sudo chroot ./chroot_ubuntu_20_04 /bin/bash /workspace/build_in_chroot.sh
+
+          echo "Build script execution finished."
+
+      - name: Unmount chroot (optional, for cleanup)
+        if: always() # Run even if previous steps fail, to attempt cleanup
+        run: |
+          echo "Unmounting chroot filesystems..."
+          if [ "${{ inputs.build_type }}" == "Debug" ]; then
+            sudo umount ./chroot_ubuntu_20_04/mnt/ccache || echo "Failed to unmount ccache dir or not mounted."
+          fi
+          sudo umount ./chroot_ubuntu_20_04/workspace || echo "Failed to unmount workspace."
+          sudo umount ./chroot_ubuntu_20_04/dev/pts || echo "Failed to unmount dev/pts."
+          sudo umount ./chroot_ubuntu_20_04/dev || echo "Failed to unmount dev."
+          sudo umount ./chroot_ubuntu_20_04/proc || echo "Failed to unmount proc."
+          sudo umount ./chroot_ubuntu_20_04/sys || echo "Failed to unmount sys."
+          echo "Chroot unmounted."
+
+      - name: Upload binary tarball (Linux, portable)
         uses: actions/upload-artifact@v4
         with:
-          name: PrismLauncher-Linux-Qt5-Portable-${{ env.VERSION }}-${{ inputs.build_type }}
-          path: PrismLauncher-portable-Qt5.tar.gz
-
-      - name: Upload binary tarball (Linux, portable, Qt 6)
-        if: runner.os == 'Linux' && matrix.qt_ver == 6
-        uses: actions/upload-artifact@v4
-        with:
-          name: PrismLauncher-Linux-Qt6-Portable-${{ env.VERSION }}-${{ inputs.build_type }}
-          path: PrismLauncher-portable-Qt6.tar.gz
+          name: PrismLauncher-Linux-Qt${{ matrix.qt_ver }}-Portable-${{ env.VERSION }}-${{ inputs.build_type }}
+          path: ${{ github.workspace }}/PrismLauncher-portable-Qt${{ matrix.qt_ver }}-${{ env.VERSION }}.tar.gz
+          retention-days: 7
